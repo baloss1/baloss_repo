@@ -11,13 +11,18 @@
 #include "call/call.h"
 
 #include <string.h>
-#include <string> 
+
 #include <algorithm>
 #include <map>
 #include <memory>
 #include <set>
 #include <utility>
 #include <vector>
+#include <mqueue.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <stdio.h>
+
 
 #include "absl/types/optional.h"
 #include "api/rtc_event_log/rtc_event_log.h"
@@ -31,6 +36,7 @@
 #include "call/receive_time_calculator.h"
 #include "call/rtp_stream_receiver_controller.h"
 #include "call/rtp_transport_controller_send.h"
+#include "call/version.h"
 #include "logging/rtc_event_log/events/rtc_event_audio_receive_stream_config.h"
 #include "logging/rtc_event_log/events/rtc_event_rtcp_packet_incoming.h"
 #include "logging/rtc_event_log/events/rtc_event_rtp_packet_incoming.h"
@@ -51,6 +57,7 @@
 #include "rtc_base/logging.h"
 #include "rtc_base/strings/string_builder.h"
 #include "rtc_base/synchronization/sequence_checker.h"
+#include "rtc_base/system/no_unique_address.h"
 #include "rtc_base/task_utils/pending_task_safety_flag.h"
 #include "rtc_base/thread_annotations.h"
 #include "rtc_base/time_utils.h"
@@ -65,10 +72,6 @@
 #include "video/video_receive_stream2.h"
 #include "video/video_send_stream.h"
 
-// Add packages for queue communication.
-#include <mqueue.h>
-#include <sys/stat.h>
-#include <fcntl.h>
 
 namespace webrtc {
 
@@ -271,6 +274,10 @@ class Call final : public webrtc::Call,
   DeliveryStatus DeliverPacket(MediaType media_type,
                                rtc::CopyOnWriteBuffer packet,
                                int64_t packet_time_us) override;
+  void DeliverPacketAsync(MediaType media_type,
+                          rtc::CopyOnWriteBuffer packet,
+                          int64_t packet_time_us,
+                          PacketCallback callback) override;
 
   // Implements RecoveredPacketReceiver.
   void OnRecoveredPacket(const uint8_t* packet, size_t length) override;
@@ -324,6 +331,7 @@ class Call final : public webrtc::Call,
   Clock* const clock_;
   TaskQueueFactory* const task_queue_factory_;
   TaskQueueBase* const worker_thread_;
+  RTC_NO_UNIQUE_ADDRESS SequenceChecker network_thread_;
 
   const int num_cpu_cores_;
   const rtc::scoped_refptr<SharedModuleThread> module_process_thread_;
@@ -537,7 +545,7 @@ class SharedModuleThread::Impl {
   }
 
  private:
-  SequenceChecker sequence_checker_;
+  RTC_NO_UNIQUE_ADDRESS SequenceChecker sequence_checker_;
   mutable int ref_count_ RTC_GUARDED_BY(sequence_checker_) = 0;
   std::unique_ptr<ProcessThread> const module_thread_;
   std::function<void()> const on_one_ref_remaining_;
@@ -627,6 +635,12 @@ Call::Call(Clock* clock,
   RTC_DCHECK(config.event_log != nullptr);
   RTC_DCHECK(config.trials != nullptr);
   RTC_DCHECK(worker_thread_->IsCurrent());
+
+  network_thread_.Detach();
+
+  // Do not remove this call; it is here to convince the compiler that the
+  // WebRTC source timestamp string needs to be in the final binary.
+  LoadWebRTCVersionInRegister();
 
   call_stats_->RegisterStatsObserver(&receive_side_cc_);
 
@@ -1417,6 +1431,30 @@ PacketReceiver::DeliveryStatus Call::DeliverPacket(
   return DeliverRtp(media_type, std::move(packet), packet_time_us);
 }
 
+void Call::DeliverPacketAsync(MediaType media_type,
+                              rtc::CopyOnWriteBuffer packet,
+                              int64_t packet_time_us,
+                              PacketCallback callback) {
+  RTC_DCHECK_RUN_ON(&network_thread_);
+
+  TaskQueueBase* network_thread = rtc::Thread::Current();
+  RTC_DCHECK(network_thread);
+
+  worker_thread_->PostTask(ToQueuedTask(
+      task_safety_, [this, network_thread, media_type, p = std::move(packet),
+                     packet_time_us, cb = std::move(callback)] {
+        RTC_DCHECK_RUN_ON(worker_thread_);
+        DeliveryStatus status = DeliverPacket(media_type, p, packet_time_us);
+        if (cb) {
+          network_thread->PostTask(
+              ToQueuedTask([cb = std::move(cb), status, media_type,
+                            p = std::move(p), packet_time_us]() {
+                cb(status, media_type, std::move(p), packet_time_us);
+              }));
+        }
+      }));
+}
+
 void Call::OnRecoveredPacket(const uint8_t* packet, size_t length) {
   RTC_DCHECK_RUN_ON(worker_thread_);
   RtpPacketReceived parsed_packet;
@@ -1444,56 +1482,38 @@ void Call::OnRecoveredPacket(const uint8_t* packet, size_t length) {
   video_receiver_controller_.OnRtpPacket(parsed_packet);
 }
 
-// add some bandit related queue communication logic 
 void Call::NotifyBweOfReceivedPacket(const RtpPacketReceived& packet,
                                      MediaType media_type) {
   auto it = receive_rtp_config_.find(packet.Ssrc());
   bool use_send_side_bwe =
       (it != receive_rtp_config_.end()) && it->second.use_send_side_bwe;
-  
-  // Add Queue A and Queue B
-  mqd_t mq_id_A;
-  mqd_t mq_id_B;
-  //mqd_t mq_id_C;
-
-  // Initialize two char pointer
-  char* A_Buffer = nullptr;
-  char* B_Buffer = nullptr;
-  strcpy(A_Buffer, "[1,2,3,4]");
-  strcpy(B_Buffer, "1");
-   
-   //QUEUE A
-   if ((mq_id_A = mq_open("/A",O_RDWR | O_CREAT | O_NONBLOCK)) == -1) {
-   	printf("mq_open_A failed \n");
-   	_exit(-1);
-   }
-
-   if (mq_send(mq_id_A,A_Buffer,sizeof(A_Buffer),1) == -1) {
-   			printf("mq_send_A failed\n");
-   			_exit(-1);
-   		}
-   else{
-    printf("****************************************************send msg to mqueue success*************************************************************************\n");
-    sleep(1);
-   }                                  
-   
-   //QUEUE B
-   if ((mq_id_B = mq_open("/B",O_RDWR | O_CREAT | O_NONBLOCK)) == -1) {
-   	printf("mq_open_B failed \n");
-   	_exit(-1);
-   }
-  
-   // QUEUE C
-   //if((mq_id_C = mq_open("/C",O_RDWR | O_CREAT | O_NONBLOCK)) == -1) {
-   	//printf("mq_open_C failed \n");
-   	//_exit(-1);
-    // }
-   
-   
-
+  //***********************************************************
+  int flag = O_RDWR;
+  int mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
+  mqd_t mqidA = mq_open("/A", flag, mode, NULL);
+  mqd_t mqidB = mq_open("/B", flag, mode, NULL);
+  if (mqidA == -1){
+      printf("open mqueue failed!\n");
+      //_exit(-1);
+  }
+  if (mqidB == -1){
+      printf("open mqueue failed!\n");
+      //_exit(-1);
+  }
+  struct mq_attr attr;
+  mq_getattr(mqidB,&attr);
+  char const *bufA = "[0.1,0.004,300000,40]";
+  char bufB[1024] = {0};
+  int s1 = mq_send(mqidA,bufA,strlen(bufA),20);
+  printf("Sended\n");
+  int s2 = mq_receive(mqidB,bufB,attr.mq_msgsize,0);
+  printf("Send: %d, Receive: %d\n",s1,s2);
+  mq_close(mqidA);
+  mq_close(mqidB);
+  //***********************************************************
   RTPHeader header;
   packet.GetHeader(&header);
-
+  
   ReceivedPacket packet_msg;
   packet_msg.size = DataSize::Bytes(packet.payload_size());
   packet_msg.receive_time = Timestamp::Millis(packet.arrival_time_ms());
